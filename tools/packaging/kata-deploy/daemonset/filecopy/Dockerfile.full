@@ -1,0 +1,178 @@
+# Full kata-deploy image for DaemonSet mode
+# Uses matching shim and agent from kata-containers RPM for version compatibility
+#
+# QEMU Installation Strategy:
+# Uses rpm-ostree to install QEMU RPMs from RHCOS extension container.
+# This installs QEMU to proper system paths (/usr/libexec/qemu-kvm) where
+# it can find its BIOS files without needing wrapper scripts or RPATH hacking.
+#
+# Initrd Strategy:
+# Uses the kata-osbuilder script from the downstream kata-containers RPM.
+# This script uses dracut (Linux's standard initramfs generator) with systemd
+# to build a proper initrd with kernel modules. This is the same approach
+# used by the OSC operator for non-CoCo workloads.
+#
+# Components from kata-containers RPM (version 3.17.0):
+# - containerd-shim-kata-v2 (Go) - from RPM
+# - kata-agent (Rust) - from RPM
+# - kata-osbuilder scripts - from RPM
+#
+# Components built here:
+# - kata-deploy (Rust) - tools/packaging/kata-deploy/binary
+
+# =============================================================================
+# Build arguments
+# =============================================================================
+# RHCOS extension container image containing QEMU RPMs
+# Get this from: oc adm release info <release> --image-for=rhel-coreos-extensions
+ARG EXTENSIONS_IMAGE=quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:1e2bb3992fdad9812eff39c72a2e6165d34aa8729be977ee06812ff104aae3b6
+
+# Base images (can be overridden for different environments)
+ARG RUST_BUILDER_IMAGE=rustlang/rust:nightly-bookworm
+ARG RUNTIME_IMAGE=quay.io/centos/centos:stream9
+
+# =============================================================================
+# Stage 1: Build Rust kata-deploy binary
+# =============================================================================
+# Note: shim and agent are taken from the downstream kata-containers RPM
+# to ensure version compatibility (both 3.17.0)
+FROM --platform=linux/amd64 ${RUST_BUILDER_IMAGE} AS rust-builder
+
+RUN apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends \
+    protobuf-compiler \
+    libprotobuf-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /kata
+
+COPY tools/packaging/kata-deploy/binary /kata/kata-deploy
+WORKDIR /kata/kata-deploy
+RUN cargo build --release
+
+# =============================================================================
+# Stage 2: Collect QEMU RPMs from RHCOS extension container
+# =============================================================================
+# These RPMs will be installed via rpm-ostree on the host node.
+# This approach installs QEMU to proper system paths (/usr/libexec/qemu-kvm)
+# where it can find its BIOS files without needing wrapper scripts.
+FROM --platform=linux/amd64 ${EXTENSIONS_IMAGE} AS extensions-source
+
+# Collect all RPMs into a single directory and extract kata-osbuilder
+FROM --platform=linux/amd64 quay.io/centos/centos:stream9 AS rpm-collector
+
+RUN dnf install -y cpio && dnf clean all
+RUN mkdir -p /rpms /kata-osbuilder
+
+# Copy kata-containers RPM and extract osbuilder scripts, shim, and agent
+# Preserve the full directory structure the osbuilder expects:
+# - osbuilder scripts at /kata-osbuilder/osbuilder/
+# - agent at /kata-osbuilder/usr/libexec/kata-containers/agent/
+# - shim at /kata-osbuilder/usr/bin/containerd-shim-kata-v2
+COPY --from=extensions-source /usr/share/rpm-ostree/extensions/kata-containers-*.rpm /rpms/
+RUN cd /tmp && rpm2cpio /rpms/kata-containers-*.rpm | cpio -idmv && \
+    mkdir -p /kata-osbuilder/osbuilder && \
+    cp -r ./usr/libexec/kata-containers/osbuilder/* /kata-osbuilder/osbuilder/ && \
+    mkdir -p /kata-osbuilder/usr/libexec/kata-containers && \
+    cp -r ./usr/libexec/kata-containers/agent /kata-osbuilder/usr/libexec/kata-containers/ && \
+    mkdir -p /kata-osbuilder/usr/bin && \
+    cp ./usr/bin/containerd-shim-kata-v2 /kata-osbuilder/usr/bin/ && \
+    cp ./usr/lib/systemd/system/kata-osbuilder-generate.service /kata-osbuilder/ && \
+    echo "3.17.0" > /kata-osbuilder/osbuilder/VERSION && \
+    echo "3.17.0" > /kata-osbuilder/VERSION && \
+    rm -rf /tmp/usr
+
+# Copy QEMU core RPMs
+COPY --from=extensions-source /usr/share/rpm-ostree/extensions/qemu-kvm-core-*.rpm /rpms/
+COPY --from=extensions-source /usr/share/rpm-ostree/extensions/virtiofsd-*.rpm /rpms/
+COPY --from=extensions-source /usr/share/rpm-ostree/extensions/qemu-kvm-common-*.rpm /rpms/
+COPY --from=extensions-source /usr/share/rpm-ostree/extensions/qemu-img-*.rpm /rpms/
+
+# BIOS/firmware
+COPY --from=extensions-source /usr/share/rpm-ostree/extensions/seabios-bin-*.rpm /rpms/
+COPY --from=extensions-source /usr/share/rpm-ostree/extensions/seavgabios-bin-*.rpm /rpms/
+COPY --from=extensions-source /usr/share/rpm-ostree/extensions/edk2-ovmf-*.rpm /rpms/
+COPY --from=extensions-source /usr/share/rpm-ostree/extensions/ipxe-roms-qemu-*.rpm /rpms/
+
+# Library dependencies (libibverbs is already in base RHCOS)
+COPY --from=extensions-source /usr/share/rpm-ostree/extensions/capstone-*.rpm /rpms/
+COPY --from=extensions-source /usr/share/rpm-ostree/extensions/pixman-*.rpm /rpms/
+COPY --from=extensions-source /usr/share/rpm-ostree/extensions/libpmem-*.rpm /rpms/
+COPY --from=extensions-source /usr/share/rpm-ostree/extensions/ndctl-libs-*.rpm /rpms/
+COPY --from=extensions-source /usr/share/rpm-ostree/extensions/daxctl-libs-*.rpm /rpms/
+COPY --from=extensions-source /usr/share/rpm-ostree/extensions/libpng-*.rpm /rpms/
+COPY --from=extensions-source /usr/share/rpm-ostree/extensions/librdmacm-*.rpm /rpms/
+COPY --from=extensions-source /usr/share/rpm-ostree/extensions/libfdt-*.rpm /rpms/
+
+# List collected RPMs for verification
+RUN ls -la /rpms/
+
+# =============================================================================
+# Stage 3: Runtime image
+# =============================================================================
+FROM --platform=linux/amd64 ${RUNTIME_IMAGE}
+
+# Install runtime dependencies
+# Note: kata-osbuilder.sh runs on the host via nsenter (uses host's dracut)
+RUN dnf install -y --setopt=install_weak_deps=False \
+    util-linux \
+    ca-certificates \
+    bash \
+    rsync \
+    && dnf clean all
+
+# Create directory structure
+RUN mkdir -p /opt/kata-artifacts/opt/kata/bin \
+    /opt/kata-artifacts/opt/kata/share/defaults/kata-containers \
+    /opt/kata-artifacts/opt/kata/libexec/kata-containers \
+    /opt/kata-artifacts/rpms \
+    /opt/kata-artifacts/selinux
+
+# Copy QEMU RPMs (will be installed via rpm-ostree on the host)
+COPY --from=rpm-collector /rpms/ /opt/kata-artifacts/rpms/
+
+# Copy kata-osbuilder scripts and agent (used to build initrd on host via nsenter)
+# Structure on host will be:
+# - /opt/kata/libexec/kata-containers/osbuilder/ (scripts)
+# - /opt/kata/libexec/kata-containers/VERSION (needed by rootfs.sh)
+# - /opt/kata/usr/libexec/kata-containers/agent/ (agent binaries for initrd)
+COPY --from=rpm-collector /kata-osbuilder/osbuilder/ /opt/kata-artifacts/opt/kata/libexec/kata-containers/osbuilder/
+COPY --from=rpm-collector /kata-osbuilder/VERSION /opt/kata-artifacts/opt/kata/libexec/kata-containers/VERSION
+COPY --from=rpm-collector /kata-osbuilder/usr/ /opt/kata-artifacts/opt/kata/usr/
+
+# Copy shim from kata-containers RPM (version 3.17.0 - matches agent)
+COPY --from=rpm-collector /kata-osbuilder/usr/bin/containerd-shim-kata-v2 \
+    /opt/kata-artifacts/opt/kata/bin/
+
+# Note: kata-agent comes from the kata-containers RPM (in osbuilder/agent directory)
+# It's already extracted in the osbuilder copy above
+# Both shim and agent are version 3.17.0 for compatibility
+
+# Copy Rust kata-deploy binary
+COPY --from=rust-builder /kata/kata-deploy/target/release/kata-deploy /usr/bin/kata-deploy
+
+# Copy configuration files
+COPY tools/packaging/kata-deploy/configuration-qemu.toml \
+    /opt/kata-artifacts/opt/kata/share/defaults/kata-containers/
+COPY tools/packaging/kata-deploy/configuration-qemu-tdx.toml \
+    /opt/kata-artifacts/opt/kata/share/defaults/kata-containers/
+COPY tools/packaging/kata-deploy/configuration-qemu-snp.toml \
+    /opt/kata-artifacts/opt/kata/share/defaults/kata-containers/
+COPY tools/packaging/kata-deploy/configuration-qemu-se.toml \
+    /opt/kata-artifacts/opt/kata/share/defaults/kata-containers/
+
+# Copy SELinux policy file (for QEMU access to /run/vc/)
+COPY tools/packaging/kata-deploy/osc_monitor.cil \
+    /opt/kata-artifacts/selinux/
+
+# Make binaries executable
+RUN chmod +x /usr/bin/kata-deploy \
+    /opt/kata-artifacts/opt/kata/bin/containerd-shim-kata-v2 \
+    /opt/kata-artifacts/opt/kata/usr/libexec/kata-containers/agent/usr/bin/kata-agent \
+    /opt/kata-artifacts/opt/kata/libexec/kata-containers/osbuilder/kata-osbuilder.sh
+
+# Note: initrd is built at runtime using kata-osbuilder.sh
+# This script runs on the host (via nsenter) and uses the host's dracut
+# to build a proper initramfs with systemd and kernel modules.
+# This is the same approach used by the OSC operator.
+
+ENTRYPOINT ["/usr/bin/kata-deploy"]

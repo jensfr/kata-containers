@@ -241,6 +241,18 @@ async fn cleanup(config: &config::Config, runtime: &str) -> Result<()> {
     artifacts::remove_artifacts(config).await?;
     info!("Successfully removed kata artifacts");
 
+    // Label node to signal cleanup completion to the operator/controller
+    // This is used for robust tracking of cleanup progress across all nodes
+    info!("Setting cleanup-complete label on node");
+    k8s::label_node(
+        config,
+        "katacontainers.io/kata-cleanup-complete",
+        Some("true"),
+        true,
+    )
+    .await?;
+    info!("Successfully set cleanup-complete label");
+
     info!("Kata Containers cleanup completed successfully");
     Ok(())
 }

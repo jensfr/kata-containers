@@ -1,0 +1,38 @@
+# Minimal kata-deploy image for testing DaemonSet mode
+# Multi-stage build for the Rust kata-deploy binary
+
+FROM --platform=linux/amd64 rust:1.90 AS builder
+
+WORKDIR /build
+
+# Copy the source code
+COPY binary /build
+
+# Build the release binary
+RUN cargo build --release
+
+# Runtime image - use Fedora 40 for newer glibc
+FROM --platform=linux/amd64 fedora:40
+
+# Install required runtime dependencies
+RUN dnf install -y --setopt=install_weak_deps=False \
+        util-linux \
+        ca-certificates && \
+    dnf clean all
+
+# Create kata artifacts directory structure
+RUN mkdir -p /opt/kata-artifacts/opt/kata/share/defaults/kata-containers
+
+# Copy minimal configuration files for testing
+COPY configuration-qemu.toml /opt/kata-artifacts/opt/kata/share/defaults/kata-containers/
+COPY configuration-qemu-tdx.toml /opt/kata-artifacts/opt/kata/share/defaults/kata-containers/
+COPY configuration-qemu-snp.toml /opt/kata-artifacts/opt/kata/share/defaults/kata-containers/
+COPY configuration-qemu-se.toml /opt/kata-artifacts/opt/kata/share/defaults/kata-containers/
+
+# Copy the Rust kata-deploy binary from builder
+COPY --from=builder /build/target/release/kata-deploy /usr/bin/kata-deploy
+
+# Make it executable
+RUN chmod +x /usr/bin/kata-deploy
+
+ENTRYPOINT ["/usr/bin/kata-deploy"]

@@ -1,0 +1,38 @@
+# Kata Containers configuration for SE (DaemonSet mode on RHCOS)
+# Uses host kernel and osbuilder-generated initrd
+# QEMU and virtiofsd extracted from RHCOS extension container RPMs
+[hypervisor.qemu]
+# QEMU extracted from extension container RPMs, deployed to /opt/kata/bin
+path = "/opt/kata/bin/qemu-system-x86_64"
+# Use host kernel - symlink created by kata-osbuilder.sh in /var/cache
+kernel = "/var/cache/kata-containers/vmlinuz.container"
+# Initrd built at runtime by osbuilder - symlink created by kata-osbuilder.sh
+initrd = "/var/cache/kata-containers/kata-containers-initrd.img"
+machine_type = "q35"
+default_vcpus = 1
+default_maxvcpus = 0
+default_memory = 2048
+default_bridges = 1
+shared_fs = "virtio-fs"
+# virtiofsd extracted from extension container RPMs
+virtio_fs_daemon = "/opt/kata/bin/virtiofsd"
+virtio_fs_cache_size = 0
+virtio_fs_cache = "auto"
+block_device_driver = "virtio-blk"
+entropy_source = "/dev/urandom"
+guest_hook_path = "/opt/kata/share/kata-containers/hooks"
+valid_hypervisor_paths = ["/opt/kata/bin/qemu-system-x86_64", "/usr/libexec/qemu-kvm"]
+
+[agent.kata]
+debug_console_enabled = false
+kernel_modules = []
+
+[runtime]
+enable_debug = false
+internetworking_model = "tcfilter"
+disable_guest_seccomp = true
+sandbox_cgroup_only = false
+static_sandbox_resource_mgmt = false
+vfio_mode = "guest-kernel"
+hypervisor_name = "qemu"
+agent_name = "kata"
