@@ -1,0 +1,82 @@
+# Kata Containers configuration for DaemonSet mode
+# Based on kata-containers RPM configuration with modifications for HCP clusters
+# QEMU and virtiofsd installed via rpm-ostree from RHCOS extension container RPMs
+
+[hypervisor.qemu]
+path = "/usr/libexec/qemu-kvm"
+# Use host kernel - symlink created by kata-osbuilder.sh in /var/cache
+kernel = "/var/cache/kata-containers/vmlinuz.container"
+# Initrd built at runtime by osbuilder - symlink created by kata-osbuilder.sh
+initrd = "/var/cache/kata-containers/kata-containers-initrd.img"
+machine_type = "q35"
+rootfs_type="ext4"
+
+enable_annotations = [".*"]
+valid_hypervisor_paths = ["/usr/libexec/qemu-kvm"]
+
+# Kernel parameters for DaemonSet mode
+kernel_params = "cgroup_no_v1=all systemd.unified_cgroup_hierarchy=1"
+
+firmware = ""
+firmware_volume = ""
+machine_accelerators=""
+cpu_features="pmu=off"
+
+default_vcpus = 1
+default_maxvcpus = 0
+default_bridges = 1
+default_memory = 2048
+default_maxmemory = 0
+
+disable_block_device_use = false
+shared_fs = "virtio-fs"
+virtio_fs_daemon = "/usr/libexec/virtiofsd"
+valid_virtio_fs_daemon_paths = ["/usr/libexec/virtiofsd"]
+virtio_fs_cache_size = 0
+virtio_fs_queue_size = 1024
+virtio_fs_extra_args = ["--thread-pool-size=1", "--announce-submounts"]
+virtio_fs_cache = "auto"
+
+block_device_driver = "virtio-scsi"
+block_device_aio = "io_uring"
+enable_iothreads = false
+enable_vhost_user_store = false
+vhost_user_store_path = "/var/run/kata-containers/vhost-user"
+enable_iommu = true
+valid_vhost_user_store_paths = ["/var/run/kata-containers/vhost-user"]
+vhost_user_reconnect_timeout_sec = 0
+valid_file_mem_backends = [""]
+pflashes = []
+enable_debug = true
+valid_entropy_sources = ["/dev/urandom","/dev/random",""]
+
+# disable applying SELinux on the VMM process (default false)
+disable_selinux=false
+
+# disable applying SELinux on the container process
+# If set to false, the type `container_t` is applied to the container process by default.
+# Note: To enable guest SELinux, the guest rootfs must be CentOS that is created and built
+# with `SELINUX=yes`.
+# (default: true)
+disable_guest_selinux=true
+
+
+[factory]
+
+[agent.kata]
+enable_debug = true
+kernel_modules=[]
+dial_timeout = 45
+
+[runtime]
+enable_debug = true
+internetworking_model="tcfilter"
+disable_guest_seccomp=true
+sandbox_cgroup_only=true
+static_sandbox_resource_mgmt=false
+sandbox_bind_mounts=[]
+vfio_mode="vfio"
+disable_guest_empty_dir=false
+experimental=[]
+create_container_timeout = 60
+dan_conf = "/run/kata-containers/dans"

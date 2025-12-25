@@ -25,6 +25,8 @@ enum Action {
     Install,
     Cleanup,
     Reset,
+    /// Remove the kata-runtime label from the node (used as preStop hook)
+    RemoveLabel,
 }
 
 #[tokio::main]
@@ -40,11 +42,18 @@ async fn main() -> Result<()> {
         return Err(anyhow::anyhow!("This program must be run as root"));
     }
 
+    // RemoveLabel is a lightweight operation that doesn't need full config validation
+    // or runtime detection. Handle it early and exit.
+    if matches!(args.action, Action::RemoveLabel) {
+        return remove_label().await;
+    }
+
     let config = config::Config::from_env()?;
     let action_str = match args.action {
         Action::Install => "install",
         Action::Cleanup => "cleanup",
         Action::Reset => "reset",
+        Action::RemoveLabel => unreachable!(), // Handled above
     };
     config.print_info(action_str);
 
@@ -77,11 +86,12 @@ async fn main() -> Result<()> {
         }
         Action::Reset => {
             reset(&config, &runtime).await?;
-            
+
             // DEPLOYMENT MODEL: Reset runs as Job
             // Exit after completion so the job can complete
             info!("Reset completed, exiting");
         }
+        Action::RemoveLabel => unreachable!(), // Handled early, before config loading
     }
 
     #[allow(unreachable_code)]
@@ -256,5 +266,52 @@ async fn reset(config: &config::Config, runtime: &str) -> Result<()> {
     runtime::lifecycle::wait_till_node_is_ready(config).await?;
 
     info!("Kata Containers reset completed successfully");
+    Ok(())
+}
+
+/// Remove the kata-runtime label from the node.
+///
+/// This is used as a preStop lifecycle hook to prevent kata workloads from
+/// being scheduled during DaemonSet rolling updates. When the kata-deploy pod
+/// is terminating, this removes the label so the node is no longer eligible
+/// for kata workloads until the new pod completes installation.
+async fn remove_label() -> Result<()> {
+    use k8s_openapi::api::core::v1::Node;
+    use kube::{api::Patch, Api, Client};
+    use serde_json::json;
+
+    info!("Removing kata-runtime label (preStop hook)");
+
+    // Get node name from environment - this is set by the DaemonSet
+    let node_name = std::env::var("NODE_NAME")
+        .map_err(|_| anyhow::anyhow!("NODE_NAME environment variable not set"))?;
+
+    // Create K8s client directly - we don't use the shared k8s::K8sClient here
+    // because we need to construct a specific patch to remove labels (set to null).
+    // The generic label_node function uses a different patching strategy that
+    // doesn't work for label removal with JSON merge patches.
+    let client = Client::try_default()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create Kubernetes client: {}", e))?;
+
+    let node_api: Api<Node> = Api::all(client);
+
+    // To remove a label with JSON merge patch, we must set it to null.
+    // Simply omitting the label from the patch won't remove it.
+    let patch = Patch::Merge(json!({
+        "metadata": {
+            "labels": {
+                "katacontainers.io/kata-runtime": null
+            }
+        }
+    }));
+
+    info!("Removing label katacontainers.io/kata-runtime from node {}", node_name);
+    node_api
+        .patch(&node_name, &kube::api::PatchParams::default(), &patch)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to remove label from node: {}", e))?;
+
+    info!("Successfully removed kata-runtime label");
     Ok(())
 }

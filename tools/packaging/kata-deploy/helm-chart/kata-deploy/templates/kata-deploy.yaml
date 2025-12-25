@@ -288,6 +288,14 @@ spec:
         - name: HOST_OS
           value: {{ . | quote }}
 {{- end }}
+{{- if eq (include "kata-deploy.isRustBuild" .) "true" }}
+        # preStop hook removes the kata-runtime label to prevent scheduling
+        # kata workloads during DaemonSet rolling updates
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/usr/bin/kata-deploy", "remove-label"]
+{{- end }}
         securityContext:
           privileged: true
         volumeMounts:
