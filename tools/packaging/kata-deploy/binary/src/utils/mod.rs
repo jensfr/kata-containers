@@ -8,5 +8,6 @@ pub mod system;
 pub mod toml;
 pub mod yaml;
 
+#[allow(unused_imports)]
 pub use platform::{Platform, PlatformPaths};
 pub use system::*;

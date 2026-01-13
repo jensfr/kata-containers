@@ -435,20 +435,21 @@ fn uninstall_qemu_via_rpm_ostree() -> Result<()> {
         }
     }
 
-    // Apply changes live if possible
-    let apply_live_args = vec!["-t", "1", "-m", "/usr/bin/rpm-ostree", "ex", "apply-live"];
-    let status = Command::new("/host/usr/bin/nsenter")
-        .args(&apply_live_args)
-        .status();
-
-    match status {
-        Ok(s) if s.success() => {
-            info!("QEMU uninstalled and changes applied live");
-        }
-        _ => {
-            log::warn!("QEMU uninstalled but node reboot may be required");
-        }
-    }
+    // NOTE: We intentionally DO NOT use apply-live for uninstallation.
+    //
+    // Analysis of MCO (machine-config-operator) and rpm-ostree shows:
+    // 1. MCO never uses apply-live - it always reboots for extension changes
+    //    (see pkg/daemon/update.go:737-739)
+    // 2. rpm-ostree apply-live deletes /etc files immediately and persistently,
+    //    but /usr changes are deferred until reboot (via overlayfs)
+    //    (see rpm-ostree/rust/src/live.rs:281-291)
+    // 3. This mismatch causes CRI-O config to be deleted while binaries still exist,
+    //    leading to CRI-O restart failures and cascading node failures
+    //    (documented in PR #1349 openshift/sandboxed-containers-operator)
+    //
+    // The safe approach is to stage the changes and require a reboot,
+    // which matches MCO's behavior for extension changes.
+    info!("QEMU packages staged for removal - node reboot required to complete uninstallation");
 
     Ok(())
 }

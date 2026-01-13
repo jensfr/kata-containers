@@ -9,7 +9,6 @@
 //! on platforms like RHCOS and RHEL, while falling back to bundled components
 //! on generic Linux distributions.
 
-use anyhow::Result;
 use std::env;
 use std::path::Path;
 
@@ -26,6 +25,7 @@ pub enum Platform {
 
 impl Platform {
     /// Detect the current platform from the environment or /etc/os-release
+    #[allow(dead_code)]
     pub fn detect() -> Self {
         // Check for explicit override via environment variable
         if let Ok(platform) = env::var("PLATFORM") {
@@ -47,6 +47,7 @@ impl Platform {
     }
 
     /// Detect platform from os-release file content
+    #[allow(dead_code)]
     fn detect_from_os_release<P: AsRef<Path>>(path: P) -> Option<Self> {
         let content = std::fs::read_to_string(path).ok()?;
         Self::parse_os_release(&content)
@@ -87,11 +88,13 @@ impl Platform {
 
 /// Platform-aware path configuration
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PlatformPaths {
     platform: Platform,
     dest_dir: String,
 }
 
+#[allow(dead_code)]
 impl PlatformPaths {
     /// Create a new PlatformPaths with the given platform and destination directory
     pub fn new(platform: Platform, dest_dir: &str) -> Self {

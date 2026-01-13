@@ -25,7 +25,8 @@
 # =============================================================================
 # RHCOS extension container image containing QEMU RPMs
 # Get this from: oc adm release info <release> --image-for=rhel-coreos-extensions
-ARG EXTENSIONS_IMAGE=quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:1e2bb3992fdad9812eff39c72a2e6165d34aa8729be977ee06812ff104aae3b6
+# OCP 4.19.21 extension image - get via: oc adm release info <release> --image-for=rhel-coreos-extensions
+ARG EXTENSIONS_IMAGE=quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:fe743e32875271e5847989cd83e05fd85c7ca2862251fda6757e3ec9d9e8f815
 
 # Base images (can be overridden for different environments)
 ARG RUST_BUILDER_IMAGE=rustlang/rust:nightly-bookworm
@@ -113,11 +114,13 @@ FROM --platform=linux/amd64 ${RUNTIME_IMAGE}
 
 # Install runtime dependencies
 # Note: kata-osbuilder.sh runs on the host via nsenter (uses host's dracut)
+# skopeo is used for dynamic extension image fetching (EXTENSIONS_IMAGE env var)
 RUN dnf install -y --setopt=install_weak_deps=False \
     util-linux \
     ca-certificates \
     bash \
     rsync \
+    skopeo \
     && dnf clean all
 
 # Create directory structure

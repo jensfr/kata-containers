@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod install;
+pub mod rpm_ostree;
 pub mod snapshotters;
 
 pub use install::*;

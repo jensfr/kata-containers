@@ -113,11 +113,14 @@ FROM --platform=linux/amd64 ${RUNTIME_IMAGE}
 
 # Install runtime dependencies
 # Note: kata-osbuilder.sh runs on the host via nsenter (uses host's dracut)
+# skopeo is needed to extract RPMs from KATA_RPMS_IMAGE at runtime
 RUN dnf install -y --setopt=install_weak_deps=False \
     util-linux \
     ca-certificates \
     bash \
     rsync \
+    skopeo \
+    tar \
     && dnf clean all
 
 # Create directory structure

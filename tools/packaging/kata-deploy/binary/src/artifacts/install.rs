@@ -99,6 +99,28 @@ pub async fn install_artifacts(config: &Config) -> Result<()> {
     // Set SELinux contexts on binaries to allow execution
     set_selinux_contexts(&config.host_install_dir)?;
 
+    // rpm-ostree: Fetch extensions from container image if KATA_RPMS_IMAGE or EXTENSIONS_IMAGE is set
+    // This enables dynamic extension selection for mixed-version clusters (HCP)
+    // MUST happen before build_initrd_with_modules() because the kata-containers RPM
+    // provides the osbuilder script and agent needed for initrd building.
+    super::rpm_ostree::fetch_extensions_from_image()?;
+
+    // rpm-ostree: Install RPMs via rpm-ostree (OpenShift HCP / DaemonSet mode)
+    // This installs QEMU, virtiofsd, and the kata-containers package which provides:
+    // - kata-osbuilder.sh (osbuilder script for initrd generation)
+    // - kata-agent (the agent binary embedded in the initrd)
+    // - containerd-shim-kata-v2 (the kata shim)
+    // MUST happen before build_initrd_with_modules() to make osbuilder available.
+    super::rpm_ostree::install_qemu_via_rpm_ostree()?;
+
+    // rpm-ostree: Create symlinks for RPM-installed binaries
+    // The kata-containers RPM installs the shim to /usr/bin/, but CRI-O configs
+    // expect it at /opt/kata/bin/. Create symlinks to bridge the gap.
+    super::rpm_ostree::create_rpm_symlinks(&config.host_install_dir)?;
+
+    // rpm-ostree: Install SELinux policy for kata-monitor and QEMU access to /run/vc/
+    super::rpm_ostree::install_selinux_policy(&config.host_install_dir)?;
+
     // Build initrd at runtime using kata-osbuilder.sh (dracut-based)
     // This is the same approach used by the OSC operator.
     // The osbuilder script:
@@ -106,13 +128,9 @@ pub async fn install_artifacts(config: &Config) -> Result<()> {
     // - Uses systemd as init
     // - Includes all necessary kernel modules (vsock, virtio_console, virtiofs, etc.)
     // - Sets up the kernel symlink automatically
+    // NOTE: This MUST run after rpm-ostree installation because the osbuilder script
+    // comes from the kata-containers RPM installed above.
     build_initrd_with_modules(&config.host_install_dir)?;
-
-    // Install QEMU via rpm-ostree (OpenShift HCP / DaemonSet mode)
-    install_qemu_via_rpm_ostree()?;
-
-    // Install SELinux policy for kata-monitor and QEMU access to /run/vc/
-    install_selinux_policy(&config.host_install_dir)?;
 
     for shim in &config.shims_for_arch {
         configure_shim_config(config, shim).await?;
@@ -134,11 +152,11 @@ pub async fn install_artifacts(config: &Config) -> Result<()> {
 pub async fn remove_artifacts(config: &Config) -> Result<()> {
     info!("deleting kata artifacts");
 
-    // Uninstall SELinux policy
-    uninstall_selinux_policy()?;
+    // rpm-ostree: Uninstall SELinux policy
+    super::rpm_ostree::uninstall_selinux_policy()?;
 
-    // Uninstall QEMU via rpm-ostree
-    uninstall_qemu_via_rpm_ostree()?;
+    // rpm-ostree: Uninstall QEMU via rpm-ostree
+    super::rpm_ostree::uninstall_qemu_via_rpm_ostree()?;
 
     if Path::new(&config.host_install_dir).exists() {
         fs::remove_dir_all(&config.host_install_dir)?;
@@ -183,275 +201,6 @@ fn copy_artifacts(src: &str, dst: &str) -> Result<()> {
     Ok(())
 }
 
-/// Install QEMU and virtiofsd via rpm-ostree on RHCOS nodes.
-/// This installs QEMU to proper system paths (/usr/libexec/qemu-kvm) where
-/// it can find its BIOS files without needing wrapper scripts.
-fn install_qemu_via_rpm_ostree() -> Result<()> {
-    use std::process::Command;
-
-    let rpm_source_dir = Path::new("/opt/kata-artifacts/rpms");
-    if !rpm_source_dir.exists() {
-        log::debug!("No RPMs directory found at {:?}, skipping rpm-ostree install", rpm_source_dir);
-        return Ok(());
-    }
-
-    // Check if rpm-ostree is available (we're on RHCOS)
-    let host_rpm_ostree = Path::new("/host/usr/bin/rpm-ostree");
-    if !host_rpm_ostree.exists() {
-        log::debug!("rpm-ostree not found at {:?}, skipping QEMU installation via rpm-ostree", host_rpm_ostree);
-        return Ok(());
-    }
-
-    // Check if QEMU is already installed
-    let qemu_path = Path::new("/host/usr/libexec/qemu-kvm");
-    if qemu_path.exists() {
-        info!("QEMU already installed at /usr/libexec/qemu-kvm, skipping rpm-ostree install");
-        return Ok(());
-    }
-
-    // Copy RPMs to host temp directory (rpm-ostree needs to access them from host paths)
-    let host_rpm_dir = Path::new("/host/tmp/kata-rpms");
-    fs::create_dir_all(host_rpm_dir)?;
-
-    for entry in fs::read_dir(rpm_source_dir)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        if src_path.extension().map_or(false, |ext| ext == "rpm") {
-            let dst_path = host_rpm_dir.join(entry.file_name());
-            fs::copy(&src_path, &dst_path)?;
-            log::debug!("Copied {:?} to {:?}", src_path, dst_path);
-        }
-    }
-
-    // Collect RPM paths for installation (from host perspective)
-    let rpm_files: Vec<String> = fs::read_dir(host_rpm_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "rpm"))
-        .map(|e| format!("/tmp/kata-rpms/{}", e.file_name().to_string_lossy()))
-        .collect();
-
-    if rpm_files.is_empty() {
-        log::warn!("No RPM files found in {:?}", host_rpm_dir);
-        return Ok(());
-    }
-
-    info!("Installing QEMU via rpm-ostree: {:?}", rpm_files);
-
-    // Run rpm-ostree install from the host using nsenter/chroot
-    // We use nsenter to run in the host's mount namespace
-    let mut args = vec![
-        "-t".to_string(), "1".to_string(),    // Target PID 1 (host init)
-        "-m".to_string(),                     // Enter mount namespace
-        "/usr/bin/rpm-ostree".to_string(),
-        "install".to_string(),
-        "--idempotent".to_string(),           // Don't fail if already installed
-        "--apply-live".to_string(),           // Apply changes immediately without reboot
-    ];
-    args.extend(rpm_files.clone());
-
-    let status = Command::new("/host/usr/bin/nsenter")
-        .args(&args)
-        .status()
-        .context("Failed to run rpm-ostree install")?;
-
-    if !status.success() {
-        // If apply-live fails, try without it (will require reboot)
-        log::warn!("rpm-ostree install --apply-live failed, trying without apply-live");
-        let mut args_without_live = vec![
-            "-t".to_string(), "1".to_string(),
-            "-m".to_string(),
-            "/usr/bin/rpm-ostree".to_string(),
-            "install".to_string(),
-            "--idempotent".to_string(),
-        ];
-        args_without_live.extend(rpm_files);
-
-        let status = Command::new("/host/usr/bin/nsenter")
-            .args(&args_without_live)
-            .status()
-            .context("Failed to run rpm-ostree install without apply-live")?;
-
-        if !status.success() {
-            anyhow::bail!("rpm-ostree install failed with exit code: {:?}", status.code());
-        }
-        log::warn!("QEMU installed but node reboot required to activate");
-    } else {
-        info!("QEMU installed successfully via rpm-ostree with apply-live");
-    }
-
-    // Cleanup temp RPMs
-    fs::remove_dir_all(host_rpm_dir).ok();
-
-    Ok(())
-}
-
-/// Install SELinux policy module for kata-monitor and QEMU access to /run/vc/.
-/// This policy (osc_monitor.cil) grants containers running QEMU access to
-/// container_var_run_t files, which is required for QMP socket communication.
-/// Also sets the container_use_devices SELinux boolean for /dev/sev access.
-fn install_selinux_policy(host_install_dir: &str) -> Result<()> {
-    use std::process::Command;
-
-    // Check if semodule is available on the host
-    let host_semodule = Path::new("/host/usr/sbin/semodule");
-    if !host_semodule.exists() {
-        log::debug!("semodule not found at {:?}, skipping SELinux policy installation", host_semodule);
-        return Ok(());
-    }
-
-    // The SELinux policy file should be in the kata artifacts
-    let policy_source = Path::new("/opt/kata-artifacts/selinux/osc_monitor.cil");
-    let policy_dest = Path::new(host_install_dir).join("share/defaults/kata-containers/osc_monitor.cil");
-
-    // Copy the policy file to the host if it exists in artifacts
-    if policy_source.exists() {
-        if let Some(parent) = policy_dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(policy_source, &policy_dest)?;
-        log::debug!("Copied SELinux policy to {:?}", policy_dest);
-    } else if !policy_dest.exists() {
-        log::debug!("SELinux policy file not found at {:?} or {:?}, skipping", policy_source, policy_dest);
-        return Ok(());
-    }
-
-    // Install the SELinux policy module using nsenter to run in host context
-    // The policy path from host perspective (without /host prefix)
-    let host_policy_path = policy_dest.to_string_lossy().replace("/host", "");
-
-    info!("Installing SELinux policy module: {}", host_policy_path);
-
-    let status = Command::new("/host/usr/bin/nsenter")
-        .args(["-t", "1", "-m", "/usr/sbin/semodule", "-i", &host_policy_path])
-        .status()
-        .context("Failed to run semodule -i")?;
-
-    if !status.success() {
-        log::warn!("semodule -i failed with exit code {:?}, SELinux policy may not be installed", status.code());
-    } else {
-        info!("SELinux policy module installed successfully");
-    }
-
-    // Set the container_use_devices boolean to allow access to /dev/sev and other devices
-    info!("Setting SELinux boolean container_use_devices=1");
-
-    let status = Command::new("/host/usr/bin/nsenter")
-        .args(["-t", "1", "-m", "/usr/sbin/setsebool", "-P", "container_use_devices", "1"])
-        .status()
-        .context("Failed to run setsebool")?;
-
-    if !status.success() {
-        log::warn!("setsebool failed with exit code {:?}", status.code());
-    } else {
-        info!("SELinux boolean container_use_devices set to 1");
-    }
-
-    Ok(())
-}
-
-/// Uninstall SELinux policy module.
-fn uninstall_selinux_policy() -> Result<()> {
-    use std::process::Command;
-
-    // Check if semodule is available on the host
-    let host_semodule = Path::new("/host/usr/sbin/semodule");
-    if !host_semodule.exists() {
-        log::debug!("semodule not found, skipping SELinux policy removal");
-        return Ok(());
-    }
-
-    info!("Removing SELinux policy module: osc_monitor");
-
-    let status = Command::new("/host/usr/bin/nsenter")
-        .args(["-t", "1", "-m", "/usr/sbin/semodule", "-r", "osc_monitor"])
-        .status();
-
-    match status {
-        Ok(s) if s.success() => {
-            info!("SELinux policy module removed successfully");
-        }
-        Ok(s) => {
-            log::debug!("semodule -r returned {:?} (module may not have been installed)", s.code());
-        }
-        Err(e) => {
-            log::debug!("Failed to run semodule -r: {}", e);
-        }
-    }
-
-    // Optionally reset the container_use_devices boolean
-    // Note: We don't reset this on uninstall as other software may need it
-    // and it's a global setting
-
-    Ok(())
-}
-
-/// Uninstall QEMU and virtiofsd via rpm-ostree.
-fn uninstall_qemu_via_rpm_ostree() -> Result<()> {
-    use std::process::Command;
-
-    // Check if rpm-ostree is available
-    let host_rpm_ostree = Path::new("/host/usr/bin/rpm-ostree");
-    if !host_rpm_ostree.exists() {
-        log::debug!("rpm-ostree not found, skipping QEMU uninstallation");
-        return Ok(());
-    }
-
-    // Check if QEMU is installed
-    let qemu_path = Path::new("/host/usr/libexec/qemu-kvm");
-    if !qemu_path.exists() {
-        log::debug!("QEMU not installed at /usr/libexec/qemu-kvm, nothing to uninstall");
-        return Ok(());
-    }
-
-    info!("Uninstalling QEMU via rpm-ostree");
-
-    // Uninstall QEMU packages using nsenter
-    let packages = ["qemu-kvm-core", "virtiofsd", "qemu-kvm-common", "seabios-bin"];
-
-    for package in packages.iter() {
-        let args = vec![
-            "-t", "1",
-            "-m",
-            "/usr/bin/rpm-ostree",
-            "uninstall",
-            "--idempotent",  // Don't fail if not installed
-            package,
-        ];
-
-        let status = Command::new("/host/usr/bin/nsenter")
-            .args(&args)
-            .status();
-
-        match status {
-            Ok(s) if s.success() => {
-                log::debug!("Uninstalled package: {}", package);
-            }
-            Ok(s) => {
-                log::debug!("Package {} may not have been installed (exit: {:?})", package, s.code());
-            }
-            Err(e) => {
-                log::warn!("Failed to uninstall {}: {}", package, e);
-            }
-        }
-    }
-
-    // Apply changes live if possible
-    let apply_live_args = vec!["-t", "1", "-m", "/usr/bin/rpm-ostree", "ex", "apply-live"];
-    let status = Command::new("/host/usr/bin/nsenter")
-        .args(&apply_live_args)
-        .status();
-
-    match status {
-        Ok(s) if s.success() => {
-            info!("QEMU uninstalled and changes applied live");
-        }
-        _ => {
-            log::warn!("QEMU uninstalled but node reboot may be required");
-        }
-    }
-
-    Ok(())
-}
 
 fn set_executable_permissions(dir: &str) -> Result<()> {
     let bin_paths = vec!["bin", "runtime-rs/bin"];
@@ -561,22 +310,51 @@ fn set_selinux_contexts(dir: &str) -> Result<()> {
 /// This script uses dracut (Linux's standard initramfs generator) with systemd
 /// to build a proper initrd with kernel modules. This is the same approach
 /// used by the OSC operator for non-CoCo workloads.
+///
+/// The osbuilder script and agent are sourced from the kata-containers RPM which is
+/// installed via rpm-ostree. This eliminates the need to bundle them in the container image.
 fn build_initrd_with_modules(dir: &str) -> Result<()> {
     use std::process::Command;
 
     info!("Building initrd using kata-osbuilder.sh (dracut-based)");
 
-    // dir is the host_install_dir (e.g., /host/opt/kata)
-    // The osbuilder was copied by copy_artifacts and is now at:
-    // {dir}/libexec/kata-containers/osbuilder/kata-osbuilder.sh
-    let osbuilder_script = Path::new(dir).join("libexec/kata-containers/osbuilder/kata-osbuilder.sh");
+    // The osbuilder script location priority:
+    // 1. RPM-installed: /host/usr/libexec/kata-containers/osbuilder/kata-osbuilder.sh
+    //    (installed by kata-containers RPM via rpm-ostree)
+    // 2. Bundled: {dir}/libexec/kata-containers/osbuilder/kata-osbuilder.sh
+    //    (bundled in container image, for backward compatibility)
+    let rpm_osbuilder = Path::new("/host/usr/libexec/kata-containers/osbuilder/kata-osbuilder.sh");
+    let bundled_osbuilder = Path::new(dir).join("libexec/kata-containers/osbuilder/kata-osbuilder.sh");
 
-    if !osbuilder_script.exists() {
-        return Err(anyhow::anyhow!(
-            "kata-osbuilder.sh not found at {:?}. Ensure the kata-containers RPM osbuilder is included in the container.",
-            osbuilder_script
-        ));
-    }
+    let (osbuilder_script, host_script_path, host_osbuilder_path, host_agent_prefix) =
+        if rpm_osbuilder.exists() {
+            info!("Using osbuilder from kata-containers RPM (installed via rpm-ostree)");
+            (
+                rpm_osbuilder.to_path_buf(),
+                "/usr/libexec/kata-containers/osbuilder/kata-osbuilder.sh".to_string(),
+                "/usr/libexec/kata-containers/osbuilder".to_string(),
+                // Agent is also from RPM at /usr/libexec/kata-containers/agent
+                // The osbuilder script looks for ${prefix}/usr/libexec/kata-containers/agent
+                // so prefix should be empty ("") when agent is at /usr/libexec/...
+                "".to_string(),
+            )
+        } else if bundled_osbuilder.exists() {
+            info!("Using bundled osbuilder from container image");
+            // For nsenter, we need paths from the host's perspective (without /host prefix)
+            let host_base = dir.strip_prefix("/host").unwrap_or(dir);
+            (
+                bundled_osbuilder,
+                format!("{}/libexec/kata-containers/osbuilder/kata-osbuilder.sh", host_base),
+                format!("{}/libexec/kata-containers/osbuilder", host_base),
+                host_base.to_string(),
+            )
+        } else {
+            return Err(anyhow::anyhow!(
+                "kata-osbuilder.sh not found. Expected at {:?} (from RPM) or {:?} (bundled). \
+                Ensure kata-containers RPM is installed via rpm-ostree.",
+                rpm_osbuilder, bundled_osbuilder
+            ));
+        };
 
     // Set executable permissions on the osbuilder script
     let chmod_status = Command::new("chmod")
@@ -588,17 +366,6 @@ fn build_initrd_with_modules(dir: &str) -> Result<()> {
         log::warn!("Failed to set executable permission on osbuilder script");
     }
 
-    // For nsenter, we need paths from the host's perspective (without /host prefix)
-    // dir is /host/opt/kata, so strip the /host prefix
-    let host_base = dir.strip_prefix("/host").unwrap_or(dir);
-
-    // Script path from host perspective
-    let host_script_path = format!("{}/libexec/kata-containers/osbuilder/kata-osbuilder.sh", host_base);
-    // Agent prefix: osbuilder looks for ${prefix}/usr/libexec/kata-containers/agent
-    // Our agent is at /opt/kata/usr/libexec/kata-containers/agent, so prefix is /opt/kata
-    let host_agent_prefix = host_base.to_string();
-    let host_osbuilder_path = format!("{}/libexec/kata-containers/osbuilder", host_base);
-
     // Run kata-osbuilder.sh on the host using nsenter
     // The script will:
     // - Use the host's dracut to generate initramfs with proper kernel modules
@@ -607,13 +374,23 @@ fn build_initrd_with_modules(dir: &str) -> Result<()> {
     // - Create symlinks in /var/cache/kata-containers/
     info!("Running kata-osbuilder.sh on host via nsenter");
 
-    let osbuilder_args = vec![
+    // Build osbuilder args conditionally
+    // -a is only needed when agent is in a non-standard location (bundled case)
+    // For RPM-installed agent, we omit -a to use the script's default (same as -o)
+    let mut osbuilder_args: Vec<&str> = vec![
         "-t", "1",                    // Target PID 1 (host init)
         "-m",                         // Enter mount namespace
         &host_script_path,
-        "-a", &host_agent_prefix,     // Agent directory prefix (looks for ${prefix}/usr/libexec/kata-containers/agent)
-        "-o", &host_osbuilder_path,   // Osbuilder directory
     ];
+
+    // Only add -a if agent prefix is non-empty (bundled osbuilder case)
+    if !host_agent_prefix.is_empty() {
+        osbuilder_args.push("-a");
+        osbuilder_args.push(&host_agent_prefix);
+    }
+
+    osbuilder_args.push("-o");
+    osbuilder_args.push(&host_osbuilder_path);
 
     let status = Command::new("/host/usr/bin/nsenter")
         .args(&osbuilder_args)
