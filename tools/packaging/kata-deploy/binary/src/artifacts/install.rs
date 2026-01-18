@@ -418,6 +418,109 @@ fn build_initrd_with_modules(dir: &str) -> Result<()> {
 
     info!("Successfully built initrd using kata-osbuilder.sh (dracut-based with systemd)");
     info!("Kernel and initrd symlinks created in /var/cache/kata-containers/");
+
+    // Fix symlinks if osbuilder created them with incorrect paths (RHCOS 9.6+ bug workaround).
+    // The kata-osbuilder.sh script in the kata-containers RPM doesn't strip quotes from
+    // /etc/os-release ID field, causing symlinks like: "rhel"-kata-<kernel>.initrd
+    // We fix this by finding the actual initrd file and correcting the symlink.
+    fix_initrd_symlink_if_broken()?;
+
+    Ok(())
+}
+
+/// Fix the initrd symlink if it points to a non-existent file.
+/// This works around a bug in kata-osbuilder.sh where it doesn't strip quotes from
+/// the distro ID, causing broken symlinks like: "rhel"-kata-5.14.0-xxx.initrd
+fn fix_initrd_symlink_if_broken() -> Result<()> {
+    use std::fs;
+    use std::process::Command;
+
+    let initrd_symlink = "/host/var/cache/kata-containers/kata-containers-initrd.img";
+    let osbuilder_images_dir = "/host/var/cache/kata-containers/osbuilder-images";
+
+    // Check if symlink exists and is broken (target doesn't exist)
+    let symlink_path = Path::new(initrd_symlink);
+    if !symlink_path.is_symlink() {
+        log::debug!("No initrd symlink found at {}, skipping fix", initrd_symlink);
+        return Ok(());
+    }
+
+    // Read the symlink target
+    let target = fs::read_link(symlink_path)
+        .context("Failed to read initrd symlink")?;
+
+    // Check if target exists (prepend /host if relative path)
+    let full_target = if target.is_absolute() {
+        format!("/host{}", target.display())
+    } else {
+        format!("/host/var/cache/kata-containers/{}", target.display())
+    };
+
+    if Path::new(&full_target).exists() {
+        log::debug!("Initrd symlink target exists, no fix needed");
+        return Ok(());
+    }
+
+    log::warn!("Broken initrd symlink detected: {} -> {}", initrd_symlink, target.display());
+
+    // Find the actual initrd file in osbuilder-images
+    // Structure: osbuilder-images/<kernel-version>/*.initrd or osbuilder-images/*.initrd
+    let mut found_initrd: Option<String> = None;
+
+    if let Ok(entries) = fs::read_dir(osbuilder_images_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // Check for initrd inside kernel version directory
+                if let Ok(subentries) = fs::read_dir(&path) {
+                    for subentry in subentries.flatten() {
+                        let subpath = subentry.path();
+                        if subpath.extension().map(|e| e == "initrd").unwrap_or(false) {
+                            // Get path relative to /host for the symlink target
+                            let rel_path = subpath.strip_prefix("/host").unwrap_or(&subpath);
+                            found_initrd = Some(rel_path.to_string_lossy().to_string());
+                            break;
+                        }
+                    }
+                }
+            } else if path.extension().map(|e| e == "initrd").unwrap_or(false) {
+                let rel_path = path.strip_prefix("/host").unwrap_or(&path);
+                found_initrd = Some(rel_path.to_string_lossy().to_string());
+            }
+            if found_initrd.is_some() {
+                break;
+            }
+        }
+    }
+
+    if let Some(correct_target) = found_initrd {
+        info!("Fixing initrd symlink to point to: {}", correct_target);
+
+        // Remove old symlink and create correct one via nsenter on host
+        let rm_status = Command::new("/host/usr/bin/nsenter")
+            .args(["-t", "1", "-m", "rm", "-f", "/var/cache/kata-containers/kata-containers-initrd.img"])
+            .status();
+
+        if let Ok(status) = rm_status {
+            if !status.success() {
+                log::warn!("Failed to remove old initrd symlink");
+            }
+        }
+
+        let ln_status = Command::new("/host/usr/bin/nsenter")
+            .args(["-t", "1", "-m", "ln", "-sf", &correct_target, "/var/cache/kata-containers/kata-containers-initrd.img"])
+            .status()
+            .context("Failed to create corrected initrd symlink")?;
+
+        if ln_status.success() {
+            info!("Successfully fixed initrd symlink");
+        } else {
+            log::warn!("Failed to create corrected initrd symlink, exit code: {:?}", ln_status.code());
+        }
+    } else {
+        log::warn!("Could not find initrd file in {} to fix symlink", osbuilder_images_dir);
+    }
+
     Ok(())
 }
 
