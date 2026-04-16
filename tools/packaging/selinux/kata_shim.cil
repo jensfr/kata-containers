@@ -1,0 +1,170 @@
+; SELinux CIL policy: dedicated Kata shimv2 domain
+;
+; Provides least-privilege confinement for the Kata Containers shim process.
+; The shim transitions from container_runtime_t to kata_shim_t on exec,
+; restricting lateral movement between pods on the same node.
+;
+; Requirements:
+;   - container-selinux (provides container_runtime_t, container_kvm_t, etc.)
+;   - systemd-based host (for cgroup creation via dbus)
+;
+; Tested: OCP 4.20 / Kata 3.21.0, Fedora/RHEL 9.x with container-selinux
+;
+; Install:
+;   semodule -i kata_shim.cil
+;   semanage fcontext -a -t kata_shim_exec_t /usr/bin/containerd-shim-kata-v2
+;   restorecon -v /usr/bin/containerd-shim-kata-v2
+
+; --- Type definitions ---
+(type kata_shim_t)
+(type kata_shim_exec_t)
+(typeattributeset domain (kata_shim_t))
+(typeattributeset file_type (kata_shim_exec_t))
+(roletype system_r kata_shim_t)
+
+; --- Domain transition ---
+; container_runtime_t (CRI-O/containerd) -> kata_shim_exec_t -> kata_shim_t
+(typetransition container_runtime_t kata_shim_exec_t process kata_shim_t)
+(allow container_runtime_t kata_shim_exec_t (file (execute read open getattr map)))
+(allow container_runtime_t kata_shim_t (process (transition signal sigkill sigchld)))
+(allow container_runtime_t kata_shim_t (unix_stream_socket (connectto read write getattr)))
+(allow container_runtime_t kata_shim_t (fd (use)))
+
+; --- Shim entrypoint and CRI-O interaction ---
+(allow kata_shim_t kata_shim_exec_t (file (entrypoint execute execute_no_trans read open getattr map)))
+(allow kata_shim_t container_runtime_t (unix_stream_socket (read write)))
+(allow kata_shim_t container_runtime_t (fd (use)))
+(allow kata_shim_t container_runtime_t (fifo_file (write)))
+
+; --- Process capabilities and self sockets ---
+(allow kata_shim_t self (process (fork signal sigchld setexec setrlimit getsched setsched getpgid setpgid)))
+(allow kata_shim_t self (capability (kill sys_admin net_admin fsetid setuid setgid chown dac_override dac_read_search fowner ipc_lock sys_resource)))
+(allow kata_shim_t self (unix_stream_socket (accept bind connect create getattr listen read setopt write connectto)))
+(allow kata_shim_t self (unix_dgram_socket (create connect read write sendto getattr)))
+(allow kata_shim_t self (udp_socket (create connect read write getattr setopt bind ioctl)))
+(allow kata_shim_t self (netlink_xfrm_socket (create bind getattr read write)))
+(allow kata_shim_t self (netlink_netfilter_socket (create bind getattr read write)))
+(allow kata_shim_t self (netlink_route_socket (create bind getattr read write nlmsg_read nlmsg_write)))
+(allow kata_shim_t self (fifo_file (getattr read write open ioctl)))
+(allow kata_shim_t self (vsock_socket (create connect getattr getopt setopt read write)))
+(allow kata_shim_t self (tun_socket (create getattr setattr read write relabelfrom relabelto attach_queue)))
+
+; --- Spawn QEMU and virtiofsd ---
+(allow kata_shim_t container_kvm_t (process (transition signal sigkill)))
+(allow kata_shim_t qemu_exec_t (file (execute read open getattr map)))
+(allow kata_shim_t bin_t (file (execute read open getattr map execute_no_trans)))
+
+; --- QEMU/virtiofsd (container_kvm_t) back-channel to shim ---
+; QEMU and virtiofsd need sockets, pipes, and fds to communicate with the shim.
+(allow container_kvm_t kata_shim_t (unix_stream_socket (accept getopt read write connectto getattr setopt listen bind create)))
+(allow container_kvm_t kata_shim_t (fifo_file (write read getattr open ioctl)))
+(allow container_kvm_t kata_shim_t (fd (use)))
+(allow container_kvm_t kata_shim_t (process (sigchld)))
+
+; Shim connects to QEMU console and QMP sockets
+(allow kata_shim_t container_kvm_t (unix_stream_socket (connectto read write getattr)))
+; Shim reads QEMU /proc entries during shutdown
+(allow kata_shim_t container_kvm_t (dir (getattr search read open)))
+(allow kata_shim_t container_kvm_t (file (getattr open read)))
+(allow kata_shim_t container_kvm_t (lnk_file (read getattr)))
+(allow kata_shim_t proc_net_t (file (getattr open read)))
+
+; QEMU cleaning up QMP/vhost-fs sockets
+(allow container_kvm_t container_var_run_t (sock_file (unlink)))
+(allow container_kvm_t spc_t (unix_stream_socket (accept getopt)))
+
+; --- Systemd / dbus ---
+; The shim creates cgroups via systemd dbus (StartTransientUnit).
+; Both send_msg directions are required -- without the init_t -> kata_shim_t
+; direction, dbus silently drops the response and the shim deadlocks.
+(allow kata_shim_t init_t (dbus (send_msg)))
+(allow init_t kata_shim_t (dbus (send_msg)))
+(allow kata_shim_t system_dbusd_t (dbus (send_msg)))
+(allow system_dbusd_t kata_shim_t (dbus (send_msg)))
+(allow kata_shim_t init_t (system (start stop status)))
+(allow kata_shim_t system_dbusd_t (unix_stream_socket (connectto)))
+(allow kata_shim_t system_dbusd_var_run_t (dir (search)))
+(allow kata_shim_t system_dbusd_var_run_t (sock_file (write)))
+(allow kata_shim_t init_t (unix_stream_socket (connectto)))
+(allow kata_shim_t init_var_run_t (dir (search)))
+(allow kata_shim_t init_var_run_t (sock_file (write)))
+
+; --- Logging ---
+(allow kata_shim_t devlog_t (sock_file (write)))
+(allow kata_shim_t devlog_t (lnk_file (read)))
+(allow kata_shim_t syslogd_var_run_t (dir (search)))
+(allow kata_shim_t kernel_t (unix_dgram_socket (sendto)))
+
+; --- Configuration ---
+(allow kata_shim_t etc_t (dir (search getattr)))
+(allow kata_shim_t etc_t (file (open read getattr)))
+(allow kata_shim_t etc_t (lnk_file (read getattr)))
+
+; --- Runtime directories ---
+; /run/containerd/s/ (ttrpc socket) -- var_run_t
+(allow kata_shim_t var_run_t (dir (add_name create getattr open read search write remove_name setattr mounton)))
+(allow kata_shim_t var_run_t (sock_file (create setattr write getattr unlink)))
+(allow kata_shim_t var_run_t (file (create open read write getattr unlink)))
+(allow kata_shim_t var_run_t (lnk_file (read getattr)))
+
+; /run/vc/ -- container_var_run_t
+(allow kata_shim_t container_var_run_t (dir (add_name create getattr open read remove_name rmdir search setattr write)))
+(allow kata_shim_t container_var_run_t (file (append create getattr map open read rename setattr unlink write)))
+(allow kata_shim_t container_var_run_t (sock_file (create getattr open read write unlink setattr)))
+(allow kata_shim_t container_var_run_t (lnk_file (create getattr read unlink)))
+(allow kata_shim_t container_var_run_t (fifo_file (getattr open read write)))
+
+; /run/kata-containers/ -- container_kvm_var_run_t
+(allow kata_shim_t container_kvm_var_run_t (dir (search getattr open read add_name write create remove_name rmdir mounton)))
+(allow kata_shim_t container_kvm_var_run_t (file (create open read write getattr unlink mounton)))
+(allow kata_shim_t container_kvm_var_run_t (sock_file (create write unlink)))
+
+; --- Container storage ---
+(allow kata_shim_t container_var_lib_t (dir (search getattr open read)))
+(allow kata_shim_t container_var_lib_t (file (getattr open read)))
+(allow kata_shim_t container_file_t (filesystem (getattr mount remount unmount)))
+(allow kata_shim_t container_file_t (dir (search getattr open read write add_name create remove_name mounton)))
+(allow kata_shim_t container_file_t (file (getattr open read write create unlink map mounton)))
+(allow kata_shim_t container_ro_file_t (dir (getattr search)))
+(allow kata_shim_t container_ro_file_t (file (getattr open read map)))
+(allow kata_shim_t container_ro_file_t (lnk_file (getattr read)))
+
+; --- Kernel and initrd paths ---
+(allow kata_shim_t var_t (dir (open read search getattr)))
+(allow kata_shim_t var_t (file (open read getattr map)))
+(allow kata_shim_t var_t (lnk_file (read getattr)))
+(allow kata_shim_t usr_t (dir (open read search getattr)))
+(allow kata_shim_t usr_t (file (open read getattr map)))
+(allow kata_shim_t usr_t (lnk_file (read getattr)))
+
+; --- Devices ---
+(allow kata_shim_t kvm_device_t (chr_file (open read write ioctl getattr)))
+(allow kata_shim_t device_t (chr_file (open read write ioctl getattr)))
+(allow kata_shim_t device_t (file (getattr)))
+(allow kata_shim_t random_device_t (chr_file (getattr open read)))
+(allow kata_shim_t console_device_t (chr_file (getattr)))
+(allow kata_shim_t vfio_device_t (chr_file (getattr)))
+(allow kata_shim_t vhost_device_t (chr_file (getattr open read write ioctl)))
+(allow kata_shim_t tun_tap_device_t (chr_file (open read write ioctl getattr)))
+
+; --- Filesystems ---
+(allow kata_shim_t tmpfs_t (dir (add_name create getattr open read search write remove_name)))
+(allow kata_shim_t tmpfs_t (file (create getattr map open read write unlink)))
+(allow kata_shim_t tmpfs_t (filesystem (getattr remount unmount mount)))
+(allow kata_shim_t proc_t (dir (open read search getattr)))
+(allow kata_shim_t proc_t (file (open read getattr)))
+(allow kata_shim_t proc_t (lnk_file (read getattr)))
+(allow kata_shim_t cgroup_t (dir (open read search getattr add_name write create remove_name)))
+(allow kata_shim_t cgroup_t (file (open read write getattr create)))
+(allow kata_shim_t cgroup_t (filesystem (getattr mount remount)))
+(allow kata_shim_t sysfs_t (dir (open read search getattr)))
+(allow kata_shim_t sysfs_t (file (open read getattr)))
+(allow kata_shim_t sysfs_t (lnk_file (read getattr)))
+(allow kata_shim_t nsfs_t (file (open read getattr)))
+(allow kata_shim_t nsfs_t (filesystem (getattr)))
+(allow kata_shim_t fs_t (filesystem (getattr unmount)))
+(allow kata_shim_t modules_object_t (dir (getattr search)))
+(allow kata_shim_t ifconfig_var_run_t (dir (getattr search)))
+(allow kata_shim_t sysctl_net_t (dir (search)))
+(allow kata_shim_t sysctl_net_t (file (open read)))
+(allow kata_shim_t root_t (dir (mounton)))

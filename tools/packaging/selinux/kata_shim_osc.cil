@@ -1,0 +1,14 @@
+; SELinux CIL policy: OpenShift Sandboxed Containers overlay for kata_shim_t
+;
+; This module adds permissions for OSC-specific components that interact
+; with the Kata shim. Install on top of kata_shim.cil.
+;
+; Requires: kata_shim.cil (base policy)
+;
+; Install:
+;   semodule -i kata_shim_osc.cil
+
+; --- OSC kata-monitor daemon ---
+; The kata-monitor process connects to the shim's monitor socket
+; for health checking and metrics collection.
+(allow osc_monitor.process kata_shim_t (unix_stream_socket (connectto)))
