@@ -16,7 +16,7 @@ spec:
     runAsUser: 1000
     runAsGroup: 1000
   restartPolicy: Always
-  runtimeClassName: kata
+  runtimeClassName: ${RUNTIME_CLASS_NAME:-kata}
   serviceAccountName: default
   imagePullSecrets:
     - name: ngc-secret-embedqa

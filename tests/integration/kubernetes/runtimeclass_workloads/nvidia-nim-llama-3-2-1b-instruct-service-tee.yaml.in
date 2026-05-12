@@ -30,7 +30,7 @@ spec:
     service:
       type: ClusterIP
       port: 8000
-  runtimeClassName: kata
+  runtimeClassName: ${RUNTIME_CLASS_NAME:-kata}
   userID: 1000
   groupID: 1000
   annotations:

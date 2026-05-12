@@ -10,7 +10,7 @@ metadata:
   labels:
     app: ${POD_NAME_CUDA}
 spec:
-  runtimeClassName: kata
+  runtimeClassName: ${RUNTIME_CLASS_NAME:-kata}
   restartPolicy: Never
   containers:
   - name: cuda-vectoradd
