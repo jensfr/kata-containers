@@ -145,55 +145,95 @@ setup() {
 	# set a policy that requires CPU0 to have affirming trust level
 	kbs_set_cpu0_resource_policy
 
-	# get measured artifacts from qemu command line of previous test
-	# Go runtime logs: "launching <path> with: [<args>]"
-	# runtime-rs logs: "qemu args: <args>"
-	log_line=$(sudo journalctl -r -x -t kata | grep -m 1 'launching.*qemu.*with:' || true)
-	if [[ -n "$log_line" ]]; then
-		qemu_cmd=$(echo "$log_line" | sed 's/.*with: \[\(.*\)\]".*/\1/')
+	if command -v veritas &>/dev/null && [[ -n "${OCP_VERSION:-}" ]]; then
+		# Use veritas to compute reference values from OCP release
+		# artifacts. This works on immutable OSes (RHCOS) where
+		# sev-snp-measure and snphost cannot be installed.
+		local veritas_out
+		veritas_out=$(mktemp -d -t veritas-XXXXX)
+
+		veritas --platform baremetal --tee snp \
+			--ocp-version "${OCP_VERSION}" \
+			--authfile "${PULL_SECRET_FILE:?PULL_SECRET_FILE must be set}" \
+			--initdata "${INITDATA_TOML:?INITDATA_TOML must be set}" \
+			-o "${veritas_out}"
+
+		# Extract snp_launch_measurement from veritas output and set
+		# as reference value in KBS.
+		launch_measurement=$(python3 -c "
+import json, glob
+for f in glob.glob('${veritas_out}/*.json'):
+    data = json.load(open(f))
+    for entry in data if isinstance(data, list) else [data]:
+        if entry.get('name') == 'snp_launch_measurement':
+            print(entry['value'][0])
+            break
+")
+		[[ -n "${launch_measurement}" ]] || \
+			{ echo "veritas did not produce snp_launch_measurement"; return 1; }
+
+		kbs_config_command set-sample-reference-value \
+			snp_launch_measurement "${launch_measurement}"
+
+		rm -rf "${veritas_out}"
+
+	elif command -v sev-snp-measure &>/dev/null; then
+		# Compute launch measurement from QEMU command line (requires
+		# node access and sev-snp-measure).
+		# Go runtime logs: "launching <path> with: [<args>]"
+		# runtime-rs logs: "qemu args: <args>"
+		log_line=$(sudo journalctl -r -x -t kata | grep -m 1 'launching.*qemu.*with:' || true)
+		if [[ -n "$log_line" ]]; then
+			qemu_cmd=$(echo "$log_line" | sed 's/.*with: \[\(.*\)\]".*/\1/')
+		else
+			log_line=$(sudo journalctl -r -x -t kata | grep -m 1 'qemu args:' || true)
+			qemu_cmd=$(echo "$log_line" | sed 's/.*qemu args: //')
+		fi
+		[[ -n "$qemu_cmd" ]] || { echo "Could not find QEMU command line"; return 1; }
+
+		kernel_path=$(echo "$qemu_cmd" | grep -oP -- '-kernel \K[^ ]+')
+		initrd_path=$(echo "$qemu_cmd" | grep -oP -- '-initrd \K[^ ]+' || true)
+		firmware_path=$(echo "$qemu_cmd" | grep -oP -- '-bios \K[^ ]+')
+		vcpu_count=$(echo "$qemu_cmd" | grep -oP -- '-smp \K\d+')
+		append=$(echo "$qemu_cmd" | grep -oP -- '-append \K.*?(?= -(smp|bios) )')
+		# Remove escape backslashes for quotes from output for dm-mod.create parameters
+		append="${append//\\\"/\"}"
+
+		measure_args=(
+			--mode=snp
+			--vcpus="${vcpu_count}"
+			--vcpu-type=EPYC-v4
+			--output-format=hex
+			--ovmf="${firmware_path}"
+			--kernel="${kernel_path}"
+			--append="${append}"
+		)
+		if [[ -n "${initrd_path}" ]]; then
+			measure_args+=(--initrd="${initrd_path}")
+		fi
+		launch_measurement=$(PATH="${PATH}:${HOME}/.local/bin" sev-snp-measure "${measure_args[@]}")
+
+		kbs_config_command set-sample-reference-value \
+			snp_launch_measurement "${launch_measurement}"
 	else
-		log_line=$(sudo journalctl -r -x -t kata | grep -m 1 'qemu args:' || true)
-		qemu_cmd=$(echo "$log_line" | sed 's/.*qemu args: //')
+		skip "Neither veritas nor sev-snp-measure available"
 	fi
-	[[ -n "$qemu_cmd" ]] || { echo "Could not find QEMU command line"; return 1; }
 
-	kernel_path=$(echo "$qemu_cmd" | grep -oP -- '-kernel \K[^ ]+')
-	initrd_path=$(echo "$qemu_cmd" | grep -oP -- '-initrd \K[^ ]+' || true)
-	firmware_path=$(echo "$qemu_cmd" | grep -oP -- '-bios \K[^ ]+')
-	vcpu_count=$(echo "$qemu_cmd" | grep -oP -- '-smp \K\d+')
-	append=$(echo "$qemu_cmd" | grep -oP -- '-append \K.*?(?= -(smp|bios) )')
-	# Remove escape backslashes for quotes from output for dm-mod.create parameters
-	append="${append//\\\"/\"}"
+	# Set TCB firmware reference values if snphost is available.
+	# Some attestation policies do not check TCB, so this is optional.
+	if command -v snphost &>/dev/null; then
+		firmware=$(sudo snphost show tcb | grep -A 5 "Reported TCB")
 
-	measure_args=(
-		--mode=snp
-		--vcpus="${vcpu_count}"
-		--vcpu-type=EPYC-v4
-		--output-format=hex
-		--ovmf="${firmware_path}"
-		--kernel="${kernel_path}"
-		--append="${append}"
-	)
-	if [[ -n "${initrd_path}" ]]; then
-		measure_args+=(--initrd="${initrd_path}")
+		microcode_version=$(echo "$firmware" | grep -oP 'Microcode:\s*\K\d+')
+		snp_version=$(echo "$firmware" | grep -oP 'SNP:\s*\K\d+')
+		tee_version=$(echo "$firmware" | grep -oP 'TEE:\s*\K\d+')
+		bootloader_version=$(echo "$firmware" | grep -oP 'Boot Loader:\s*\K\d+')
+
+		kbs_config_command set-sample-reference-value --as-integer snp_bootloader "${bootloader_version}"
+		kbs_config_command set-sample-reference-value --as-integer snp_microcode "${microcode_version}"
+		kbs_config_command set-sample-reference-value --as-integer snp_snp_svn "${snp_version}"
+		kbs_config_command set-sample-reference-value --as-integer snp_tee_svn "${tee_version}"
 	fi
-	launch_measurement=$(PATH="${PATH}:${HOME}/.local/bin" sev-snp-measure "${measure_args[@]}")
-
-	# set launch measurement as reference value
-	kbs_config_command set-sample-reference-value snp_launch_measurement "${launch_measurement}"
-
-	# Get the reported firmware version(s) for this machine
-	firmware=$(sudo snphost show tcb | grep -A 5 "Reported TCB")
-
-	microcode_version=$(echo "$firmware" | grep -oP 'Microcode:\s*\K\d+')
-	snp_version=$(echo "$firmware" | grep -oP 'SNP:\s*\K\d+')
-	tee_version=$(echo "$firmware" | grep -oP 'TEE:\s*\K\d+')
-	bootloader_version=$(echo "$firmware" | grep -oP 'Boot Loader:\s*\K\d+')
-
-	kbs_config_command set-sample-reference-value --as-integer snp_bootloader "${bootloader_version}"
-	kbs_config_command set-sample-reference-value --as-integer snp_microcode "${microcode_version}"
-	kbs_config_command set-sample-reference-value --as-integer snp_snp_svn "${snp_version}"
-	kbs_config_command set-sample-reference-value --as-integer snp_tee_svn "${tee_version}"
 
 	kubectl apply -f "${K8S_TEST_YAML}"
 
