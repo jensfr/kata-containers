@@ -47,6 +47,11 @@ KATA_HYPERVISOR="${KATA_HYPERVISOR:-}"
 KATA_HOST_OS="${KATA_HOST_OS:-}"
 RUNS_ON_AKS="${RUNS_ON_AKS:-false}"
 
+# Node label used to identify kata-capable nodes. Override for platforms
+# that use a different label (e.g., OpenShift sandboxed containers).
+KATA_NODE_LABEL="${KATA_NODE_LABEL:-katacontainers.io/kata-runtime=true}"
+export KATA_NODE_LABEL
+
 # Common setup for tests.
 #
 # Global variables exported:
@@ -75,7 +80,7 @@ get_pod_config_dir() {
 # Return the first worker found that is kata-runtime labeled.
 get_one_kata_node() {
 	local resource_name
-	resource_name="$(kubectl get node -l katacontainers.io/kata-runtime=true -o name | head -1)"
+	resource_name="$(kubectl get node -l "${KATA_NODE_LABEL}" -o name | head -1)"
 	# Remove leading "/node"
 	echo "${resource_name/"node/"}"
 }
