@@ -24,8 +24,14 @@ HTTPS_PROXY="${HTTPS_PROXY:-}"
 readonly COCO_TRUSTEE_DIR="/tmp/trustee"
 # Where the kbs sources will be cloned
 readonly COCO_KBS_DIR="${COCO_TRUSTEE_DIR}/kbs"
-# The k8s namespace where the kbs service is deployed
-readonly KBS_NS="coco-tenant"
+# The k8s namespace where the kbs service is deployed.
+# Override for platforms that deploy KBS in a different namespace
+# (e.g., trustee-operator-system for OpenShift sandboxed containers).
+KBS_NS="${KBS_NS:-coco-tenant}"
+# Direct KBS URL. When set, skips k8s service discovery and uses this
+# URL for all kbs-client calls. Useful for platforms that expose KBS
+# via an HTTPS route or external endpoint.
+KBS_URL="${KBS_URL:-}"
 # The private key file used for CLI authentication
 readonly KBS_PRIVATE_KEY="${KBS_PRIVATE_KEY:-/opt/trustee/install/kbs.key}"
 # The kbs service name
@@ -538,8 +544,14 @@ kbs_k8s_svc_port() {
 }
 
 # Return the kbs service HTTP address (http://host:port).
+# If KBS_URL is set, return it directly without service discovery.
 #
 kbs_k8s_svc_http_addr() {
+	if [[ -n "${KBS_URL}" ]]; then
+		echo "${KBS_URL}"
+		return
+	fi
+
 	local host
 	local port
 
