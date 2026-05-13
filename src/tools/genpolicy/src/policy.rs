@@ -449,6 +449,12 @@ pub struct CommonData {
 
     /// Default capabilities for a privileged container.
     pub privileged_caps: Vec<String>,
+
+    #[serde(default)]
+    pub sandbox_name_key: Option<String>,
+
+    #[serde(default)]
+    pub sandbox_namespace_key: Option<String>,
 }
 
 /// Configuration from "kubectl config".
